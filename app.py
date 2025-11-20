@@ -23,6 +23,7 @@ try:
     PROMPT_LIBRARY_AVAILABLE = True
 except ImportError:
     PROMPT_LIBRARY_AVAILABLE = False
+    DEFAULT_TEMPLATES = {}
 
 st.set_page_config(
     page_title="智能文档填充工具",
@@ -30,47 +31,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# ==========================================
-# 🔒 新增：密码保护层 (固定密码: password)
-# ==========================================
-def check_password():
-    """检查密码，如果未通过则停止运行"""
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
-    if not st.session_state.authenticated:
-        # 简单的登录界面样式
-        st.markdown(
-            """
-            <style>
-            .stTextInput > div > div > input {text-align: center;}
-            </style>
-            <div style='text-align: center; margin-top: 50px;'>
-                <h1>🔒 请输入访问密码</h1>
-                <p style='color: gray;'>系统受保护，请输入密码以继续</p>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-        
-        password = st.text_input("密码", type="password", key="login_password")
-        
-        if password:
-            if password == "password": # 这里设置你的固定密码
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("❌ 密码错误，请重试")
-        
-        st.stop() # ⛔ 停止执行后续代码
-
-# 执行密码检查
-check_password()
-
-# ==========================================
-# ✅ 验证通过，执行主程序
-# ==========================================
 
 CONFIG_FILE = "api_config.json"
 
@@ -135,9 +95,38 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ========== 配置管理 (已针对云端优化) ==========
+# ========== 初始化 Session State ==========
+def init_session_state():
+    """初始化所有必要的Session State变量"""
+    defaults = {
+        'step': 1,
+        'show_prompt_editor': False,
+        'template_file': None,
+        'template_filename': '',
+        'old_customer_info': {},
+        'new_customer_info': {},
+        'replacement_mapping': {},
+        'uploaded_image_data': None,
+        'custom_replacements': [],
+        'current_prompt': None,
+        'api_type': 'gemini_custom',
+        'api_key': '',
+        'base_url': '',
+        'model_name': '',
+        'model_list': [],
+        'prompt_settings': {}
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session_state()
+
+# ========== 配置管理 ==========
 def load_config():
-    """加载配置文件"""
+    """加载配置（优先使用Secrets）"""
+    
     default_config = {
         'api_type': 'gemini_custom',
         'api_key': '',
@@ -146,16 +135,25 @@ def load_config():
         'model_list': [],
         'prompt_settings': {
             'global_prompt': '',
-            'templates': {},
+            'templates': DEFAULT_TEMPLATES.copy() if PROMPT_LIBRARY_AVAILABLE else {},
         }
     }
-    # 优先从 Streamlit Secrets 读取 (如果配置了)
-    if hasattr(st, "secrets") and "api_config" in st.secrets:
-        try:
-            return {**default_config, **st.secrets["api_config"]}
-        except Exception:
-            pass
-
+    
+    # 优先使用 Streamlit Secrets（云平台）
+    try:
+        if 'api_key' in st.secrets:
+            return {
+                'api_type': st.secrets.get('api_type', default_config['api_type']),
+                'api_key': st.secrets.get('api_key', ''),
+                'base_url': st.secrets.get('base_url', ''),
+                'model_name': st.secrets.get('model_name', ''),
+                'model_list': st.secrets.get('model_list', []),
+                'prompt_settings': default_config['prompt_settings']
+            }
+    except Exception:
+        pass
+    
+    # 回退到本地配置文件
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -163,10 +161,15 @@ def load_config():
                 return {**default_config, **loaded}
         except Exception as e:
             st.warning(f"⚠️ 配置加载失败: {str(e)}")
+    
     return default_config
 
 def save_config():
-    """保存配置 (增加异常处理，防止云端无权限报错)"""
+    """保存配置到本地（云平台环境检测）"""
+    # 检测是否在云平台环境
+    if 'STREAMLIT_SERVER_RUNDIR' in os.environ:
+        return True  # 云平台环境，不保存本地文件
+    
     config = {
         'api_type': st.session_state.api_type,
         'api_key': st.session_state.api_key,
@@ -179,11 +182,7 @@ def save_config():
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
         return True
-    except OSError:
-        # 云端环境通常是只读的，无法保存文件，忽略此错误
-        return False
     except Exception as e:
-        # 其他错误依然提示
         st.error(f"❌ 保存失败: {str(e)}")
         return False
 
@@ -205,21 +204,17 @@ def get_clean_base_url(url):
 def fetch_models_list(api_type, api_key, base_url):
     """获取模型列表（统一接口）"""
     
-    # 官方 OpenAI
     if api_type == "openai_official":
         try:
             client = OpenAI(api_key=api_key, timeout=10)
             models = client.models.list()
-            return [m.id for m in models.data if 'gpt' in m.id.lower()]
+            return [m.id for m in models.data if 'gpt' in m.id.lower()], None
         except Exception as e:
             return None, f"OpenAI 官方连接失败: {str(e)}"
     
-    # 官方 Claude
     elif api_type == "claude_official":
-        # Claude 官方不提供模型列表接口，返回预设
         return API_TYPES["claude_official"]["default_models"], None
     
-    # 官方 Gemini
     elif api_type == "gemini_official":
         try:
             genai.configure(api_key=api_key)
@@ -229,7 +224,6 @@ def fetch_models_list(api_type, api_key, base_url):
         except Exception as e:
             return None, f"Gemini 官方连接失败: {str(e)}"
     
-    # 自定义 API（OpenAI 兼容格式）
     elif api_type in ["openai_custom", "claude_custom", "gemini_custom"]:
         if not base_url:
             return None, "请填写 Base URL"
@@ -276,7 +270,6 @@ def test_api_connection(api_type, api_key, base_url, model_name):
 def call_ai_api(prompt, api_type=None, api_key=None, base_url=None, model_name=None, image_data=None, custom_prompt=None):
     """统一的 AI 调用接口"""
     
-    # 获取配置
     if api_type is None:
         api_type = st.session_state.get('api_type', 'gemini_custom')
     if api_key is None:
@@ -286,16 +279,14 @@ def call_ai_api(prompt, api_type=None, api_key=None, base_url=None, model_name=N
     if model_name is None:
         model_name = st.session_state.get('model_name', '')
     
-    # 增强提示词
     enhanced_prompt = get_enhanced_prompt(prompt, custom_prompt)
     
     try:
-        # ========== OpenAI 官方 ==========
         if api_type == "openai_official":
             if not api_key:
                 return None, "请配置 OpenAI API Key"
             
-            client = OpenAI(api_key=api_key, timeout=60)
+            client = OpenAI(api_key=api_key, timeout=120)
             
             if image_data and 'gpt-4' in model_name:
                 messages = [{
@@ -315,7 +306,6 @@ def call_ai_api(prompt, api_type=None, api_key=None, base_url=None, model_name=N
             )
             return response.choices[0].message.content, None
         
-        # ========== Claude 官方 ==========
         elif api_type == "claude_official":
             if not api_key:
                 return None, "请配置 Claude API Key"
@@ -337,7 +327,6 @@ def call_ai_api(prompt, api_type=None, api_key=None, base_url=None, model_name=N
             )
             return message.content[0].text, None
         
-        # ========== Gemini 官方 ==========
         elif api_type == "gemini_official":
             if not api_key:
                 return None, "请配置 Gemini API Key"
@@ -354,7 +343,6 @@ def call_ai_api(prompt, api_type=None, api_key=None, base_url=None, model_name=N
             
             return response.text, None
         
-        # ========== 自定义 API（OpenAI 兼容格式）==========
         elif api_type in ["openai_custom", "claude_custom", "gemini_custom"]:
             if not base_url:
                 return None, "请配置 Base URL"
@@ -364,7 +352,7 @@ def call_ai_api(prompt, api_type=None, api_key=None, base_url=None, model_name=N
             client = OpenAI(
                 api_key=api_key if api_key else "sk-dummy",
                 base_url=clean_url,
-                timeout=60.0,
+                timeout=120.0,
                 max_retries=1,
                 default_headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -409,12 +397,10 @@ def clean_json_response(response_text):
     
     text = response_text.strip()
     
-    # 提取 ```json ``` 代码块
     match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
     if match:
         text = match.group(1)
     
-    # 正则提取 JSON 对象
     match = re.search(r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}', text, re.DOTALL)
     if match:
         return match.group(0)
@@ -439,7 +425,7 @@ def parse_json_safely(response_text, context=""):
         error_details = {
             'error': f"JSON 解析失败 ({context}): {str(e)}",
             'original_response': response_text[:500],
-            'cleaned_response': clean_json_response(response_text[:500])
+            'cleaned_response': clean_json_response(response_text)[:500]
         }
         return None, error_details
 
@@ -572,190 +558,107 @@ def create_replacement_mapping(old_info, new_info, custom_prompt=None):
         return None, error
     return parse_json_safely(response_text, "创建替换映射")
 
-# =======================================================
-# 📌 修复：Word 文档替换逻辑
-# =======================================================
-
+# ========== 【关键修复】文本替换函数 ==========
 def replace_text_in_paragraph(paragraph, old_text, new_text):
     """
-    【简化强化版】更可靠的段落文本替换
-    策略：完全重建段落 runs，保留第一个 run 的格式
-    
-    返回: (replace_success: bool, count: int)
+    【重点修复】正确的 Word 段落替换方式
+    云平台和本地都能用的通用方法
     """
-    full_text = paragraph.text
+    if old_text not in paragraph.text:
+        return False
+    
+    if len(paragraph.runs) == 1:
+        paragraph.runs[0].text = paragraph.runs[0].text.replace(old_text, new_text)
+        return True
+    
+    full_text = ''.join(run.text for run in paragraph.runs)
     
     if old_text not in full_text:
-        return False, 0
+        return False
     
-    # 执行一次替换
-    new_full_text = full_text.replace(old_text, new_text, 1)
+    new_text_full = full_text.replace(old_text, new_text)
     
-    if new_full_text == full_text:
-        return False, 0
-    
-    # 保存第一个 run 的格式（如果存在）
-    first_run_format = None
-    if paragraph.runs:
-        first_run = paragraph.runs[0]
-        first_run_format = {
-            'bold': first_run.bold,
-            'italic': first_run.italic,
-            'underline': first_run.underline,
-            'font_name': first_run.font.name,
-            'font_size': first_run.font.size,
-        }
-    
-    # 清空所有 runs
     for run in paragraph.runs:
-        run.text = ""
+        r = run._element
+        r.getparent().remove(r)
     
-    # 创建新 run 或使用第一个 run
-    if paragraph.runs:
-        new_run = paragraph.runs[0]
-    else:
-        new_run = paragraph.add_run()
+    new_run = paragraph.add_run(new_text_full)
     
-    new_run.text = new_full_text
-    
-    # 恢复格式
-    if first_run_format:
-        try:
-            new_run.bold = first_run_format['bold']
-            new_run.italic = first_run_format['italic']
-            new_run.underline = first_run_format['underline']
-            if first_run_format['font_name']:
-                new_run.font.name = first_run_format['font_name']
-            if first_run_format['font_size']:
-                new_run.font.size = first_run_format['font_size']
-        except:
-            pass  # 格式恢复失败不影响替换
-    
-    return True, 1
+    return True
 
-
-def apply_replacements_to_document(doc, replacement_mapping, debug_mode=False):
-    """应用替换到文档（增加调试信息）"""
+def apply_replacements_to_document(doc, replacement_mapping):
+    """
+    【改进版】文档替换函数 - 云平台专优化
+    """
     replace_count = 0
     replace_log = []
-    debug_info = []
+    failed_items = []
     
-    # 按长度排序，避免短字符串误替换
-    sorted_map = sorted(replacement_mapping.items(), key=lambda x: len(str(x[0])), reverse=True)
+    sorted_items = sorted(
+        replacement_mapping.items(),
+        key=lambda x: len(str(x[0])),
+        reverse=True
+    )
     
-    for old_val, new_val in sorted_map:
+    for old_val, new_val in sorted_items:
         if not old_val or not new_val:
             continue
         
-        current_count = 0
-        old_s = str(old_val)
-        new_s = str(new_val)
+        old_str = str(old_val).strip()
+        new_str = str(new_val).strip()
         
-        if debug_mode:
-            debug_info.append(f"\n🔍 开始处理: '{old_s}' → '{new_s}'")
+        if not old_str or not new_str:
+            continue
         
-        # 1. 替换段落
-        para_count = 0
-        for idx, p in enumerate(doc.paragraphs):
-            if old_s in p.text:
-                if debug_mode:
-                    debug_info.append(f"  📝 段落 {idx} 包含目标文本")
-                    debug_info.append(f"     原文: {p.text[:100]}")
+        replaced_locations = []
+        
+        try:
+            for para_idx, para in enumerate(doc.paragraphs):
+                try:
+                    if replace_text_in_paragraph(para, old_str, new_str):
+                        replaced_locations.append(f"段落[{para_idx}]")
+                except Exception:
+                    pass
+            
+            for table_idx, table in enumerate(doc.tables):
+                for row_idx, row in enumerate(table.rows):
+                    for cell_idx, cell in enumerate(row.cells):
+                        try:
+                            for para in cell.paragraphs:
+                                if replace_text_in_paragraph(para, old_str, new_str):
+                                    replaced_locations.append(f"表格[{table_idx}-{row_idx}-{cell_idx}]")
+                        except Exception:
+                            pass
+            
+            for section_idx, section in enumerate(doc.sections):
+                try:
+                    for para in section.header.paragraphs:
+                        if replace_text_in_paragraph(para, old_str, new_str):
+                            replaced_locations.append(f"页眉[{section_idx}]")
+                except Exception:
+                    pass
                 
-                total_paragraph_replacements = 0
-                while True:
-                    success, count = replace_text_in_paragraph(p, old_s, new_s)
-                    total_paragraph_replacements += count
-                    if not success:
-                        break
-                
-                if debug_mode and total_paragraph_replacements > 0:
-                    debug_info.append(f"     ✅ 替换了 {total_paragraph_replacements} 处")
-                    debug_info.append(f"     结果: {p.text[:100]}")
-                
-                para_count += total_paragraph_replacements
+                try:
+                    for para in section.footer.paragraphs:
+                        if replace_text_in_paragraph(para, old_str, new_str):
+                            replaced_locations.append(f"页脚[{section_idx}]")
+                except Exception:
+                    pass
+            
+            if replaced_locations:
+                replace_count += len(replaced_locations)
+                locations_str = ", ".join(replaced_locations[:5])
+                if len(replaced_locations) > 5:
+                    locations_str += f"... 等{len(replaced_locations)-5}处"
+                replace_log.append(f"✓ '{old_str}' → '{new_str}' ({len(replaced_locations)}处)")
+            else:
+                replace_log.append(f"⚠ '{old_str}' → '{new_str}' (未找到匹配项)")
         
-        current_count += para_count
-        
-        # 2. 替换表格
-        table_count = 0
-        for ti, t in enumerate(doc.tables):
-            for ri, r in enumerate(t.rows):
-                for ci, c in enumerate(r.cells):
-                    for pi, p in enumerate(c.paragraphs):
-                        if old_s in p.text:
-                            if debug_mode:
-                                debug_info.append(f"  📊 表格 {ti} 行 {ri} 列 {ci} 包含目标文本")
-                            
-                            total_cell_replacements = 0
-                            while True:
-                                success, count = replace_text_in_paragraph(p, old_s, new_s)
-                                total_cell_replacements += count
-                                if not success:
-                                    break
-                            
-                            if debug_mode and total_cell_replacements > 0:
-                                debug_info.append(f"     ✅ 替换了 {total_cell_replacements} 处")
-                            
-                            table_count += total_cell_replacements
-        
-        current_count += table_count
-        
-        # 3. 替换页眉页脚
-        header_count = 0
-        for si, section in enumerate(doc.sections):
-            for header in [section.header, section.footer]:
-                if header:
-                    for pi, p in enumerate(header.paragraphs):
-                        if old_s in p.text:
-                            if debug_mode:
-                                debug_info.append(f"  📋 节 {si} 页眉/页脚包含目标文本")
-                            
-                            total_header_replacements = 0
-                            while True:
-                                success, count = replace_text_in_paragraph(p, old_s, new_s)
-                                total_header_replacements += count
-                                if not success:
-                                    break
-                            
-                            if debug_mode and total_header_replacements > 0:
-                                debug_info.append(f"     ✅ 替换了 {total_header_replacements} 处")
-                            
-                            header_count += total_header_replacements
-        
-        current_count += header_count
-        
-        if current_count > 0:
-            replace_count += current_count
-            replace_log.append(f"✓ 替换 '{old_s}' → '{new_s}' ({current_count}处: 段落{para_count}+表格{table_count}+页眉页脚{header_count})")
-        else:
-            replace_log.append(f"⚠️ 未找到 '{old_s}'")
-            if debug_mode:
-                debug_info.append(f"  ❌ 全文未找到此文本")
+        except Exception as e:
+            replace_log.append(f"✗ '{old_str}' → '{new_str}' (错误)")
+            failed_items.append((old_str, new_str, str(e)))
     
-    if debug_mode:
-        return replace_count, replace_log, debug_info
-    
-    return replace_count, replace_log
-
-# =======================================================
-# 📌 修复结束
-# =======================================================
-
-
-# ========== 初始化 Session State ==========
-if 'step' not in st.session_state:
-    st.session_state.step = 1
-if 'show_prompt_editor' not in st.session_state:
-    st.session_state.show_prompt_editor = False
-
-for k in ['template_file', 'template_filename', 'old_customer_info', 'new_customer_info', 
-          'replacement_mapping', 'uploaded_image_data', 'custom_replacements', 'current_prompt']:
-    if k not in st.session_state:
-        st.session_state[k] = None if 'file' in k or 'image' in k or 'prompt' in k else {}
-
-if st.session_state.custom_replacements is None:
-    st.session_state.custom_replacements = []
+    return replace_count, replace_log, failed_items
 
 # 加载配置
 cfg = load_config()
@@ -776,7 +679,6 @@ if 'prompt_settings' not in st.session_state:
 with st.sidebar:
     st.markdown("## ⚙️ API 配置")
     
-    # 1. 选择 API 类型
     api_type_options = list(API_TYPES.keys())
     api_type_labels = [API_TYPES[k]["name"] for k in api_type_options]
     
@@ -798,7 +700,6 @@ with st.sidebar:
         save_config()
         st.rerun()
     
-    # 2. API Key
     api_key_input = st.text_input(
         "API Key" + (" *必填" if "official" in st.session_state.api_type else " (可选)"),
         value=st.session_state.api_key,
@@ -810,7 +711,6 @@ with st.sidebar:
         st.session_state.api_key = api_key_input
         save_config()
     
-    # 3. Base URL（仅自定义需要）
     if API_TYPES[st.session_state.api_type]["needs_url"]:
         base_url_input = st.text_input(
             "Base URL *必填",
@@ -824,8 +724,6 @@ with st.sidebar:
             save_config()
     
     st.markdown("---")
-    
-    # 4. 模型管理
     st.markdown("### 📋 模型管理")
     
     col1, col2 = st.columns(2)
@@ -869,7 +767,6 @@ with st.sidebar:
                     else:
                         st.error(message)
     
-    # 5. 模型选择
     if st.session_state.model_list:
         model_options = list(st.session_state.model_list)
         if st.session_state.model_name and st.session_state.model_name not in model_options:
@@ -889,7 +786,6 @@ with st.sidebar:
             save_config()
             st.rerun()
     else:
-        # 手动输入模型名称
         model_input = st.text_input(
             "模型名称（手动输入）",
             value=st.session_state.model_name,
@@ -902,8 +798,6 @@ with st.sidebar:
             save_config()
     
     st.markdown("---")
-    
-    # 6. 格式说明
     st.markdown("## 📄 格式说明")
     st.info("""
 **仅支持 .docx 格式**
@@ -918,7 +812,6 @@ with st.sidebar:
 st.markdown('<div class="main-header">📄 智能文档填充工具</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">仿照模式 - AI学习已填好的文档</div>', unsafe_allow_html=True)
 
-# 顶部模型信息
 if st.session_state.api_key or st.session_state.base_url:
     api_name = API_TYPES.get(st.session_state.api_type, {}).get("name", "未知")
     st.markdown(f"""
@@ -929,7 +822,6 @@ if st.session_state.api_key or st.session_state.base_url:
 else:
     st.warning("⚠️ 请在左侧侧边栏配置 API")
 
-# 进度指示
 progress_cols = st.columns(5)
 steps = ["上传文档", "AI分析", "输入数据", "确认替换", "下载"]
 for i, col in enumerate(progress_cols, 1):
@@ -943,7 +835,7 @@ for i, col in enumerate(progress_cols, 1):
 
 st.markdown("---")
 
-# ==================== 步骤1: 上传参考文档 ====================
+# ==================== 步骤1 ====================
 if st.session_state.step >= 1:
     st.markdown("## 步骤1️⃣: 上传参考文档")
     st.info("💡 上传一份已经填写好的文档，AI会学习它的填写方式")
@@ -963,11 +855,10 @@ if st.session_state.step >= 1:
             st.session_state.step = 2
             st.rerun()
 
-# ==================== 步骤2: AI分析文档 ====================
+# ==================== 步骤2 ====================
 if st.session_state.step >= 2:
     st.markdown("## 步骤2️⃣: AI分析参考文档")
     
-    # 提示词编辑器
     if st.session_state.step == 2:
         with st.expander("💡 查看/编辑提示词（可选）", expanded=st.session_state.show_prompt_editor):
             st.markdown("### 临时自定义提示词")
@@ -1001,7 +892,6 @@ if st.session_state.step >= 2:
         elif not st.session_state.model_name:
             st.error("❌ 请先在侧边栏选择模型")
         else:
-            # 关键修复：指针复位
             st.session_state.template_file.seek(0)
             doc = Document(st.session_state.template_file)
             
@@ -1028,8 +918,6 @@ if st.session_state.step >= 2:
                 with col1:
                     if st.button("⬅️ 返回重试", use_container_width=True):
                         st.session_state.step = 1
-                        st.session_state.old_customer_info = {}
-                        st.session_state.current_prompt = None
                         st.rerun()
                 with col2:
                     if st.button("💡 调整提示词", use_container_width=True):
@@ -1061,12 +949,11 @@ if st.session_state.step >= 2:
                 st.session_state.step = 3
                 st.rerun()
 
-# ==================== 步骤3: 输入新数据 ====================
+# ==================== 步骤3 ====================
 if st.session_state.step >= 3:
     st.markdown("## 步骤3️⃣: 输入新数据")
     st.info("💡 随意输入，AI会自动识别格式")
     
-    # 提示词编辑器
     with st.expander("💡 查看/编辑提示词（可选）"):
         st.markdown("### 临时自定义提示词")
         st.caption("仅在本次提取中生效")
@@ -1153,7 +1040,7 @@ Tel 159-1234-5678"""
             st.session_state.step = 2
             st.rerun()
 
-# ==================== 步骤4: 确认替换映射 ====================
+# ==================== 步骤4 ====================
 if st.session_state.step >= 4:
     st.markdown("## 步骤4️⃣: 确认替换内容")
     
@@ -1183,7 +1070,6 @@ if st.session_state.step >= 4:
                 
                 if st.button("⬅️ 返回"):
                     st.session_state.step = 3
-                    st.session_state.replacement_mapping = {}
                     st.rerun()
             else:
                 st.session_state.replacement_mapping = mapping
@@ -1195,10 +1081,7 @@ if st.session_state.step >= 4:
         
         edited_mapping = {}
         
-        # 排除 null 值，只展示有替换意向的项
-        filtered_mapping = {k: v for k, v in st.session_state.replacement_mapping.items() if v is not None}
-
-        for old_val, new_val in filtered_mapping.items():
+        for old_val, new_val in st.session_state.replacement_mapping.items():
             st.markdown('<div class="replace-preview">', unsafe_allow_html=True)
             
             col1, col2, col3 = st.columns([2, 1, 2])
@@ -1212,13 +1095,16 @@ if st.session_state.step >= 4:
             
             with col3:
                 st.markdown("**新值:**")
-                edited_val = st.text_input(
-                    f"edit_{old_val}",
-                    value=new_val,
-                    label_visibility="collapsed",
-                    key=f"edit_{hash(old_val)}"
-                )
-                edited_mapping[old_val] = edited_val
+                if new_val is not None and new_val.strip():
+                    edited_val = st.text_input(
+                        f"edit_{old_val}",
+                        value=new_val,
+                        label_visibility="collapsed",
+                        key=f"edit_{hash(old_val)}"
+                    )
+                    edited_mapping[old_val] = edited_val
+                else:
+                    st.markdown("*(未提供，将留空)*")
             
             st.markdown('</div>', unsafe_allow_html=True)
         
@@ -1305,76 +1191,97 @@ if st.session_state.step >= 4:
                 st.session_state.step = 5
                 st.rerun()
 
-# ==================== 步骤5: 生成并下载文档 ====================
+# ==================== 步骤5 ====================
 if st.session_state.step >= 5:
     st.markdown("## 步骤5️⃣: 生成新文档")
     
-    # 添加调试模式开关
-    debug_mode = st.checkbox("🔍 启用调试模式（查看详细替换过程）", value=False)
+    with st.expander("🔍 前置检查", expanded=False):
+        st.write(f"**Template file:** {st.session_state.template_filename}")
+        st.write(f"**Replacement mapping count:** {len(st.session_state.replacement_mapping)}")
+        st.write(f"**First 3 items:** {list(st.session_state.replacement_mapping.keys())[:3]}")
     
-    with st.spinner("正在生成新文档..."):
-        # 关键修复：指针复位
-        st.session_state.template_file.seek(0)
-        doc = Document(st.session_state.template_file)
-        
-        if debug_mode:
-            replace_count, replace_log, debug_info = apply_replacements_to_document(
-                doc, 
-                st.session_state.replacement_mapping,
-                debug_mode=True
-            )
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        generate_button = st.button("▶️ 开始生成文档", type="primary", use_container_width=True)
+    
+    if generate_button:
+        with st.spinner("正在处理文档..."):
+            try:
+                if hasattr(st.session_state.template_file, 'seek'):
+                    st.session_state.template_file.seek(0)
+                
+                doc = Document(st.session_state.template_file)
+                st.info(f"✓ 文档加载成功 (段落数: {len(doc.paragraphs)}, 表格数: {len(doc.tables)})")
+                
+                replace_count, replace_log, failed_items = apply_replacements_to_document(
+                    doc, 
+                    st.session_state.replacement_mapping
+                )
+                
+                output = BytesIO()
+                doc.save(output)
+                output_bytes = output.getvalue()
+                output.close()
+                
+                st.success(f"✅ 文档处理完成！共替换 {replace_count} 处")
+                
+                with st.expander("📋 替换详情", expanded=True):
+                    for log in replace_log:
+                        st.markdown(f"  {log}")
+                    
+                    if failed_items:
+                        st.warning("⚠️ 部分替换失败:")
+                        for old, new, error in failed_items[:5]:
+                            st.markdown(f"  • `{old}` → `{new}`")
+                
+                st.markdown("---")
+                
+                original_name = st.session_state.template_filename
+                new_filename = original_name.replace('.docx', '_已填充.docx')
+                
+                st.download_button(
+                    label="⬇️ 下载生成的文档",
+                    data=output_bytes,
+                    file_name=new_filename,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary",
+                    use_container_width=True
+                )
+                
+                st.markdown("---")
+                
+                if st.button("🔄 重新开始", use_container_width=True):
+                    st.session_state.step = 1
+                    st.session_state.template_file = None
+                    st.session_state.template_filename = ''
+                    st.session_state.old_customer_info = {}
+                    st.session_state.new_customer_info = {}
+                    st.session_state.replacement_mapping = {}
+                    st.session_state.uploaded_image_data = None
+                    st.session_state.custom_replacements = []
+                    st.session_state.current_prompt = None
+                    st.rerun()
             
-            # 显示调试信息
-            with st.expander("🐛 调试信息", expanded=True):
-                st.code("\n".join(debug_info), language="text")
-        else:
-            replace_count, replace_log = apply_replacements_to_document(
-                doc, 
-                st.session_state.replacement_mapping
-            )
-        
-        # 关键修复：使用 BytesIO 内存操作
-        output = BytesIO()
-        doc.save(output)
-        output.seek(0)
-        
-        if replace_count > 0:
-            st.success(f"✅ 文档生成完成！共替换 {replace_count} 处")
-        else:
-            st.warning(f"⚠️ 文档已生成，但未执行任何替换。请检查原文档中是否包含待替换内容。")
-        
-        with st.expander("📋 查看替换详情", expanded=True):
-            for log in replace_log:
-                st.markdown(log)
-        
-        original_name = st.session_state.template_filename
-        # 修复文件名后缀
-        new_filename = f"已填充_{original_name}"
-        if not new_filename.lower().endswith(".docx"):
-            new_filename = original_name.replace('.docx', '') + '_已填充.docx'
-        
-        st.download_button(
-            label="⬇️ 下载新文档",
-            data=output,
-            file_name=new_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            type="primary",
-            use_container_width=True
-        )
-        
-        st.markdown("---")
-        
-        if st.button("🔄 重新开始", use_container_width=True):
-            st.session_state.step = 1
-            st.session_state.template_file = None
-            st.session_state.template_filename = ''
-            st.session_state.old_customer_info = {}
-            st.session_state.new_customer_info = {}
-            st.session_state.replacement_mapping = {}
-            st.session_state.uploaded_image_data = None
-            st.session_state.custom_replacements = []
-            st.session_state.current_prompt = None
-            st.rerun()
+            except Exception as e:
+                st.error(f"❌ 文档处理失败")
+                
+                with st.expander("🔍 错误详情", expanded=True):
+                    import traceback
+                    error_text = traceback.format_exc()
+                    st.code(error_text, language='python')
+                    
+                    st.markdown("**可能的原因：**")
+                    st.markdown("""
+                    1. 文件格式不支持 - 确保是 .docx 格式
+                    2. 文件损坏 - 尝试用 Office 打开并保存
+                    3. 内存限制 - 文件过大（Streamlit Cloud 限制 100MB）
+                    4. 编码问题 - 文件包含特殊字符
+                    """)
+                
+                if st.button("⬅️ 返回上一步"):
+                    st.session_state.step = 4
+                    st.rerun()
 
 # ==================== 页脚 ====================
 st.markdown("---")
