@@ -146,7 +146,7 @@ def load_config():
         'model_list': [],
         'prompt_settings': {
             'global_prompt': '',
-            'templates': DEFAULT_TEMPLATES.copy() if PROMPT_LIBRARY_AVAILABLE else {},
+            'templates': {},
         }
     }
     # 优先从 Streamlit Secrets 读取 (如果配置了)
@@ -439,7 +439,6 @@ def parse_json_safely(response_text, context=""):
         error_details = {
             'error': f"JSON 解析失败 ({context}): {str(e)}",
             'original_response': response_text[:500],
-            # 修复了此处缺失的右括号
             'cleaned_response': clean_json_response(response_text[:500])
         }
         return None, error_details
@@ -574,98 +573,72 @@ def create_replacement_mapping(old_info, new_info, custom_prompt=None):
     return parse_json_safely(response_text, "创建替换映射")
 
 # =======================================================
-# 📌 修复：Word 文档替换逻辑，解决替换计数为 0 的问题
+# 📌 修复：Word 文档替换逻辑
 # =======================================================
 
 def replace_text_in_paragraph(paragraph, old_text, new_text):
     """
-    【升级版替换】
-    在段落中替换文本，处理跨越多个 run 的复杂情况。
-    每次调用只替换第一个匹配项，以便在外部循环中处理同一段落的多个匹配。
+    【简化强化版】更可靠的段落文本替换
+    策略：完全重建段落 runs，保留第一个 run 的格式
     
     返回: (replace_success: bool, count: int)
     """
-    if old_text not in paragraph.text:
+    full_text = paragraph.text
+    
+    if old_text not in full_text:
         return False, 0
     
-    # 使用正则表达式找到第一个匹配项
-    text_to_search = paragraph.text
-    match = re.search(re.escape(old_text), text_to_search)
+    # 执行一次替换
+    new_full_text = full_text.replace(old_text, new_text, 1)
     
-    if not match:
+    if new_full_text == full_text:
         return False, 0
-
-    # 找到匹配的起始和结束索引
-    match_start = match.start()
-    match_end = match.end()
     
-    runs_text = [run.text for run in paragraph.runs]
+    # 保存第一个 run 的格式（如果存在）
+    first_run_format = None
+    if paragraph.runs:
+        first_run = paragraph.runs[0]
+        first_run_format = {
+            'bold': first_run.bold,
+            'italic': first_run.italic,
+            'underline': first_run.underline,
+            'font_name': first_run.font.name,
+            'font_size': first_run.font.size,
+        }
     
-    # 找到 match 跨越的 run 索引
-    char_index = 0
-    start_run_index = -1
-    end_run_index = -1
+    # 清空所有 runs
+    for run in paragraph.runs:
+        run.text = ""
     
-    for i, run_text in enumerate(runs_text):
-        if start_run_index == -1 and char_index + len(run_text) > match_start:
-            start_run_index = i
-        if char_index + len(run_text) >= match_end:
-            end_run_index = i
-            break
-        char_index += len(run_text)
-
-    if start_run_index == -1 or end_run_index == -1:
-        return False, 0
-
-    # 1. 处理起始 run
-    start_run = paragraph.runs[start_run_index]
+    # 创建新 run 或使用第一个 run
+    if paragraph.runs:
+        new_run = paragraph.runs[0]
+    else:
+        new_run = paragraph.add_run()
     
-    # 计算在起始 run 中的偏移量
-    start_run_base_len = sum(len(r.text) for r in paragraph.runs[:start_run_index])
-    start_offset = match_start - start_run_base_len
+    new_run.text = new_full_text
     
-    # 2. 处理结束 run
-    end_run = paragraph.runs[end_run_index]
-    
-    # 计算在结束 run 之后的文本偏移量
-    end_run_base_len = sum(len(r.text) for r in paragraph.runs[:end_run_index])
-    end_offset_in_run = match_end - end_run_base_len
-    
-    
-    # 3. 核心替换逻辑：
-    
-    # 起始 run 的前缀部分
-    prefix = start_run.text[:start_offset]
-    
-    # 结束 run 的后缀部分
-    suffix = end_run.text[end_offset_in_run:]
-    
-    # 4. 清理并合并：
-    
-    # 清空所有被替换的 run（从 start_run_index + 1 到 end_run_index）
-    # 包括了 end_run_index 自身，以便在下一步重新设置其文本
-    for i in range(start_run_index + 1, end_run_index + 1):
-        paragraph.runs[i].text = ""
-
-    # 清理起始 run
-    start_run.text = "" 
-    
-    # 最终将所有内容合并到起始 run 中，并保持其原有格式
-    start_run.text = prefix + new_text + suffix
-    
-    # 5. 清理多余的 runs
-    # 尽管我们清空了文本，但 runs 仍然存在。这里清空 start_run 后的 runs 以保持文档整洁
-    if start_run_index != end_run_index:
-        # 清空 end_run
-        end_run.text = ""
+    # 恢复格式
+    if first_run_format:
+        try:
+            new_run.bold = first_run_format['bold']
+            new_run.italic = first_run_format['italic']
+            new_run.underline = first_run_format['underline']
+            if first_run_format['font_name']:
+                new_run.font.name = first_run_format['font_name']
+            if first_run_format['font_size']:
+                new_run.font.size = first_run_format['font_size']
+        except:
+            pass  # 格式恢复失败不影响替换
     
     return True, 1
 
 
-def apply_replacements_to_document(doc, replacement_mapping):
-    """应用替换到文档"""
+def apply_replacements_to_document(doc, replacement_mapping, debug_mode=False):
+    """应用替换到文档（增加调试信息）"""
     replace_count = 0
     replace_log = []
+    debug_info = []
     
     # 按长度排序，避免短字符串误替换
     sorted_map = sorted(replacement_mapping.items(), key=lambda x: len(str(x[0])), reverse=True)
@@ -678,47 +651,93 @@ def apply_replacements_to_document(doc, replacement_mapping):
         old_s = str(old_val)
         new_s = str(new_val)
         
-        # 1. 替换段落 (使用 while 循环处理同一段落内的多次替换)
-        for p in doc.paragraphs:
-            total_paragraph_replacements = 0
-            while True:
-                success, count = replace_text_in_paragraph(p, old_s, new_s)
-                total_paragraph_replacements += count
-                if not success:
-                    break
-            current_count += total_paragraph_replacements
+        if debug_mode:
+            debug_info.append(f"\n🔍 开始处理: '{old_s}' → '{new_s}'")
+        
+        # 1. 替换段落
+        para_count = 0
+        for idx, p in enumerate(doc.paragraphs):
+            if old_s in p.text:
+                if debug_mode:
+                    debug_info.append(f"  📝 段落 {idx} 包含目标文本")
+                    debug_info.append(f"     原文: {p.text[:100]}")
+                
+                total_paragraph_replacements = 0
+                while True:
+                    success, count = replace_text_in_paragraph(p, old_s, new_s)
+                    total_paragraph_replacements += count
+                    if not success:
+                        break
+                
+                if debug_mode and total_paragraph_replacements > 0:
+                    debug_info.append(f"     ✅ 替换了 {total_paragraph_replacements} 处")
+                    debug_info.append(f"     结果: {p.text[:100]}")
+                
+                para_count += total_paragraph_replacements
+        
+        current_count += para_count
         
         # 2. 替换表格
-        for t in doc.tables:
-            for r in t.rows:
-                for c in r.cells:
-                    for p in c.paragraphs:
-                        total_cell_replacements = 0
-                        while True:
-                            success, count = replace_text_in_paragraph(p, old_s, new_s)
-                            total_cell_replacements += count
-                            if not success:
-                                break
-                        current_count += total_cell_replacements
+        table_count = 0
+        for ti, t in enumerate(doc.tables):
+            for ri, r in enumerate(t.rows):
+                for ci, c in enumerate(r.cells):
+                    for pi, p in enumerate(c.paragraphs):
+                        if old_s in p.text:
+                            if debug_mode:
+                                debug_info.append(f"  📊 表格 {ti} 行 {ri} 列 {ci} 包含目标文本")
+                            
+                            total_cell_replacements = 0
+                            while True:
+                                success, count = replace_text_in_paragraph(p, old_s, new_s)
+                                total_cell_replacements += count
+                                if not success:
+                                    break
+                            
+                            if debug_mode and total_cell_replacements > 0:
+                                debug_info.append(f"     ✅ 替换了 {total_cell_replacements} 处")
+                            
+                            table_count += total_cell_replacements
+        
+        current_count += table_count
         
         # 3. 替换页眉页脚
-        for section in doc.sections:
+        header_count = 0
+        for si, section in enumerate(doc.sections):
             for header in [section.header, section.footer]:
                 if header:
-                    for p in header.paragraphs:
-                        total_header_replacements = 0
-                        while True:
-                            success, count = replace_text_in_paragraph(p, old_s, new_s)
-                            total_header_replacements += count
-                            if not success:
-                                break
-                        current_count += total_header_replacements
+                    for pi, p in enumerate(header.paragraphs):
+                        if old_s in p.text:
+                            if debug_mode:
+                                debug_info.append(f"  📋 节 {si} 页眉/页脚包含目标文本")
+                            
+                            total_header_replacements = 0
+                            while True:
+                                success, count = replace_text_in_paragraph(p, old_s, new_s)
+                                total_header_replacements += count
+                                if not success:
+                                    break
+                            
+                            if debug_mode and total_header_replacements > 0:
+                                debug_info.append(f"     ✅ 替换了 {total_header_replacements} 处")
+                            
+                            header_count += total_header_replacements
+        
+        current_count += header_count
         
         if current_count > 0:
             replace_count += current_count
-            replace_log.append(f"✓ 替换 '{old_s}' → '{new_s}' ({current_count}处)")
+            replace_log.append(f"✓ 替换 '{old_s}' → '{new_s}' ({current_count}处: 段落{para_count}+表格{table_count}+页眉页脚{header_count})")
+        else:
+            replace_log.append(f"⚠️ 未找到 '{old_s}'")
+            if debug_mode:
+                debug_info.append(f"  ❌ 全文未找到此文本")
+    
+    if debug_mode:
+        return replace_count, replace_log, debug_info
     
     return replace_count, replace_log
+
 # =======================================================
 # 📌 修复结束
 # =======================================================
@@ -1290,22 +1309,39 @@ if st.session_state.step >= 4:
 if st.session_state.step >= 5:
     st.markdown("## 步骤5️⃣: 生成新文档")
     
+    # 添加调试模式开关
+    debug_mode = st.checkbox("🔍 启用调试模式（查看详细替换过程）", value=False)
+    
     with st.spinner("正在生成新文档..."):
         # 关键修复：指针复位
         st.session_state.template_file.seek(0)
         doc = Document(st.session_state.template_file)
         
-        replace_count, replace_log = apply_replacements_to_document(
-            doc, 
-            st.session_state.replacement_mapping
-        )
+        if debug_mode:
+            replace_count, replace_log, debug_info = apply_replacements_to_document(
+                doc, 
+                st.session_state.replacement_mapping,
+                debug_mode=True
+            )
+            
+            # 显示调试信息
+            with st.expander("🐛 调试信息", expanded=True):
+                st.code("\n".join(debug_info), language="text")
+        else:
+            replace_count, replace_log = apply_replacements_to_document(
+                doc, 
+                st.session_state.replacement_mapping
+            )
         
         # 关键修复：使用 BytesIO 内存操作
         output = BytesIO()
         doc.save(output)
         output.seek(0)
         
-        st.success(f"✅ 文档生成完成！共替换 {replace_count} 处")
+        if replace_count > 0:
+            st.success(f"✅ 文档生成完成！共替换 {replace_count} 处")
+        else:
+            st.warning(f"⚠️ 文档已生成，但未执行任何替换。请检查原文档中是否包含待替换内容。")
         
         with st.expander("📋 查看替换详情", expanded=True):
             for log in replace_log:
