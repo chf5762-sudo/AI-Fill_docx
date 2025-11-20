@@ -439,7 +439,7 @@ def parse_json_safely(response_text, context=""):
         error_details = {
             'error': f"JSON 解析失败 ({context}): {str(e)}",
             'original_response': response_text[:500],
-            'cleaned_response': clean_json_response(response_text[:500]
+            'cleaned_response': clean_json_response(response_text[:500])
         }
         return None, error_details
 
