@@ -557,6 +557,8 @@ def run_app():
 
     # ==================== 侧边栏 ====================
     with st.sidebar:
+        # 侧边栏的登录/登出逻辑已移至主程序入口
+        
         st.markdown("---")
         st.markdown("## ⚙️ API 配置")
         
@@ -706,7 +708,7 @@ def run_app():
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.warning("⚠️ 请在左侧侧边栏配置 API")
+        st.warning("⚠️ 请在侧边栏配置 API")
 
     # 进度指示
     progress_cols = st.columns(5)
@@ -1058,6 +1060,7 @@ st.set_page_config(
 # --- 1. 配置认证器 ---
 # 默认用户：document_user，密码：password
 # 密码 'password' 的哈希值（已使用 bcrypt 生成）
+# 确保这个列表只包含一个元素，即哈希后的密码字符串
 hashed_passwords = ['\$2b\$12\$R.32u.L.V/iH4H62hX9y4.2c6dF6j/g7e8JpWzY5Xq3hY0hP5J3xG']
 
 config = {
@@ -1085,15 +1088,16 @@ authenticator = stauth.Authenticate(
     config['cookie']['expiry_days']
 )
 
-# --- 3. 登录逻辑 ---
-# 侧边栏的登录/登出需要在主程序中进行
-st.sidebar.title("🔐 登录/登出")
-name, authentication_status, username = authenticator.login('Login', 'main')
+# --- 3. 登录逻辑 (修复 ValueError) ---
+# 统一在主页面渲染登录表单，并获取状态。
+# 这样调用可以确保 login 组件在主页正确渲染，不会与 location 冲突。
+name, authentication_status, username = authenticator.login('用户登录', 'main') 
 
 
 if st.session_state["authentication_status"]:
     # 登录成功
     st.sidebar.success(f'欢迎回来, {st.session_state["name"]}!')
+    # 登出按钮放在侧边栏
     authenticator.logout('退出登录', 'sidebar')
 
     # 运行应用的主体功能
@@ -1107,7 +1111,7 @@ elif st.session_state["authentication_status"] is False:
     
 elif st.session_state["authentication_status"] is None:
     # 尚未登录
-    st.warning('⚠️ 请先在侧边栏输入您的用户名和密码以继续')
+    st.warning('⚠️ 请先输入您的用户名和密码以继续')
     st.markdown("---")
     st.info("💡 默认用户名：`document_user`，密码：`password`")
     st.markdown("### 📄 智能文档填充工具")
