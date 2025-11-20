@@ -439,6 +439,7 @@ def parse_json_safely(response_text, context=""):
         error_details = {
             'error': f"JSON 解析失败 ({context}): {str(e)}",
             'original_response': response_text[:500],
+            # 修复了此处缺失的右括号
             'cleaned_response': clean_json_response(response_text[:500])
         }
         return None, error_details
@@ -572,17 +573,94 @@ def create_replacement_mapping(old_info, new_info, custom_prompt=None):
         return None, error
     return parse_json_safely(response_text, "创建替换映射")
 
+# =======================================================
+# 📌 修复：Word 文档替换逻辑，解决替换计数为 0 的问题
+# =======================================================
+
 def replace_text_in_paragraph(paragraph, old_text, new_text):
-    """在段落中替换文本"""
+    """
+    【升级版替换】
+    在段落中替换文本，处理跨越多个 run 的复杂情况。
+    每次调用只替换第一个匹配项，以便在外部循环中处理同一段落的多个匹配。
+    
+    返回: (replace_success: bool, count: int)
+    """
     if old_text not in paragraph.text:
-        return False
-    # 简单替换，若需保留复杂格式（如加粗部分文字）需更复杂的 run 遍历逻辑
-    # 但为了保证云端稳定性，这里使用 text 整体替换
-    try:
-        paragraph.text = paragraph.text.replace(old_text, new_text)
-    except Exception:
-        pass # 忽略编码等错误
-    return True
+        return False, 0
+    
+    # 使用正则表达式找到第一个匹配项
+    text_to_search = paragraph.text
+    match = re.search(re.escape(old_text), text_to_search)
+    
+    if not match:
+        return False, 0
+
+    # 找到匹配的起始和结束索引
+    match_start = match.start()
+    match_end = match.end()
+    
+    runs_text = [run.text for run in paragraph.runs]
+    
+    # 找到 match 跨越的 run 索引
+    char_index = 0
+    start_run_index = -1
+    end_run_index = -1
+    
+    for i, run_text in enumerate(runs_text):
+        if start_run_index == -1 and char_index + len(run_text) > match_start:
+            start_run_index = i
+        if char_index + len(run_text) >= match_end:
+            end_run_index = i
+            break
+        char_index += len(run_text)
+
+    if start_run_index == -1 or end_run_index == -1:
+        return False, 0
+
+    # 1. 处理起始 run
+    start_run = paragraph.runs[start_run_index]
+    
+    # 计算在起始 run 中的偏移量
+    start_run_base_len = sum(len(r.text) for r in paragraph.runs[:start_run_index])
+    start_offset = match_start - start_run_base_len
+    
+    # 2. 处理结束 run
+    end_run = paragraph.runs[end_run_index]
+    
+    # 计算在结束 run 之后的文本偏移量
+    end_run_base_len = sum(len(r.text) for r in paragraph.runs[:end_run_index])
+    end_offset_in_run = match_end - end_run_base_len
+    
+    
+    # 3. 核心替换逻辑：
+    
+    # 起始 run 的前缀部分
+    prefix = start_run.text[:start_offset]
+    
+    # 结束 run 的后缀部分
+    suffix = end_run.text[end_offset_in_run:]
+    
+    # 4. 清理并合并：
+    
+    # 清空所有被替换的 run（从 start_run_index + 1 到 end_run_index）
+    # 包括了 end_run_index 自身，以便在下一步重新设置其文本
+    for i in range(start_run_index + 1, end_run_index + 1):
+        paragraph.runs[i].text = ""
+
+    # 清理起始 run
+    start_run.text = "" 
+    
+    # 最终将所有内容合并到起始 run 中，并保持其原有格式
+    start_run.text = prefix + new_text + suffix
+    
+    # 5. 清理多余的 runs
+    # 尽管我们清空了文本，但 runs 仍然存在。这里清空 start_run 后的 runs 以保持文档整洁
+    if start_run_index != end_run_index:
+        # 清空 end_run
+        end_run.text = ""
+    
+    return True, 1
+
 
 def apply_replacements_to_document(doc, replacement_mapping):
     """应用替换到文档"""
@@ -600,28 +678,51 @@ def apply_replacements_to_document(doc, replacement_mapping):
         old_s = str(old_val)
         new_s = str(new_val)
         
+        # 1. 替换段落 (使用 while 循环处理同一段落内的多次替换)
         for p in doc.paragraphs:
-            if replace_text_in_paragraph(p, old_s, new_s):
-                current_count += 1
+            total_paragraph_replacements = 0
+            while True:
+                success, count = replace_text_in_paragraph(p, old_s, new_s)
+                total_paragraph_replacements += count
+                if not success:
+                    break
+            current_count += total_paragraph_replacements
         
+        # 2. 替换表格
         for t in doc.tables:
             for r in t.rows:
                 for c in r.cells:
                     for p in c.paragraphs:
-                        if replace_text_in_paragraph(p, old_s, new_s):
-                            current_count += 1
+                        total_cell_replacements = 0
+                        while True:
+                            success, count = replace_text_in_paragraph(p, old_s, new_s)
+                            total_cell_replacements += count
+                            if not success:
+                                break
+                        current_count += total_cell_replacements
         
+        # 3. 替换页眉页脚
         for section in doc.sections:
             for header in [section.header, section.footer]:
-                for p in header.paragraphs:
-                    if replace_text_in_paragraph(p, old_s, new_s):
-                        current_count += 1
+                if header:
+                    for p in header.paragraphs:
+                        total_header_replacements = 0
+                        while True:
+                            success, count = replace_text_in_paragraph(p, old_s, new_s)
+                            total_header_replacements += count
+                            if not success:
+                                break
+                        current_count += total_header_replacements
         
         if current_count > 0:
             replace_count += current_count
             replace_log.append(f"✓ 替换 '{old_s}' → '{new_s}' ({current_count}处)")
     
     return replace_count, replace_log
+# =======================================================
+# 📌 修复结束
+# =======================================================
+
 
 # ========== 初始化 Session State ==========
 if 'step' not in st.session_state:
@@ -908,6 +1009,8 @@ if st.session_state.step >= 2:
                 with col1:
                     if st.button("⬅️ 返回重试", use_container_width=True):
                         st.session_state.step = 1
+                        st.session_state.old_customer_info = {}
+                        st.session_state.current_prompt = None
                         st.rerun()
                 with col2:
                     if st.button("💡 调整提示词", use_container_width=True):
@@ -1061,6 +1164,7 @@ if st.session_state.step >= 4:
                 
                 if st.button("⬅️ 返回"):
                     st.session_state.step = 3
+                    st.session_state.replacement_mapping = {}
                     st.rerun()
             else:
                 st.session_state.replacement_mapping = mapping
@@ -1072,7 +1176,10 @@ if st.session_state.step >= 4:
         
         edited_mapping = {}
         
-        for old_val, new_val in st.session_state.replacement_mapping.items():
+        # 排除 null 值，只展示有替换意向的项
+        filtered_mapping = {k: v for k, v in st.session_state.replacement_mapping.items() if v is not None}
+
+        for old_val, new_val in filtered_mapping.items():
             st.markdown('<div class="replace-preview">', unsafe_allow_html=True)
             
             col1, col2, col3 = st.columns([2, 1, 2])
@@ -1086,16 +1193,13 @@ if st.session_state.step >= 4:
             
             with col3:
                 st.markdown("**新值:**")
-                if new_val is not None and new_val.strip():
-                    edited_val = st.text_input(
-                        f"edit_{old_val}",
-                        value=new_val,
-                        label_visibility="collapsed",
-                        key=f"edit_{hash(old_val)}"
-                    )
-                    edited_mapping[old_val] = edited_val
-                else:
-                    st.markdown("*(未提供，将留空)*")
+                edited_val = st.text_input(
+                    f"edit_{old_val}",
+                    value=new_val,
+                    label_visibility="collapsed",
+                    key=f"edit_{hash(old_val)}"
+                )
+                edited_mapping[old_val] = edited_val
             
             st.markdown('</div>', unsafe_allow_html=True)
         
@@ -1208,7 +1312,10 @@ if st.session_state.step >= 5:
                 st.markdown(log)
         
         original_name = st.session_state.template_filename
+        # 修复文件名后缀
         new_filename = f"已填充_{original_name}"
+        if not new_filename.lower().endswith(".docx"):
+            new_filename = original_name.replace('.docx', '') + '_已填充.docx'
         
         st.download_button(
             label="⬇️ 下载新文档",
