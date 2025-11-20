@@ -31,3 +31,4 @@ tornado>=6.3.0
 watchdog>=3.0.0
 pyyaml
 streamlit-authenticator
+python-docx
